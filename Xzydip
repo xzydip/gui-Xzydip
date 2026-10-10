@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# ============================================================
+#  XZYDIP - Pterodactyl Panel / Wings / Docker / Cloudflare
+#  Supports: Ubuntu 22.04 / 24.04, Debian 11 / 12
+# ============================================================
+
+BRAND="XZYDIP"
+PANEL_DIR="/var/www/pterodactyl"
+PHPV="8.3"
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Run as root:  sudo -i  then run the command again."
+    exit 1
+fi
+
+command -v whiptail >/dev/null 2>&1 || { apt-get update -y; apt-get install -y whiptail; }
+
+pause() { read -rp "Press Enter to go back to menu..."; }
+ask()   { local v; read -rp "$1" v; echo "${v:-$2}"; }
+rand()  { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-24}"; }
+
+# ============================================================
+# 1. PANEL (own installer)
+# ============================================================
+install_panel() {
+    . /etc/os-release
+    echo "== $BRAND Panel Installer ($PRETTY_NAME) =="
+
+    PANEL_URL=$(ask "Panel URL (e.g. https://panel.example.com): " "http://localhost")
+    ADMIN_EMAIL=$(ask "Admin email: " "admin@example.com")
+    ADMIN_USER=$(ask "Admin username [admin]: " "admin")
+    ADMIN_PASS=$(ask "Admin password [random]: " "$(rand 14)")
+    TZ_NAME=$(ask "Timezone [Asia/Kolkata]: " "Asia/Kolkata")
+    DB_PASS=$(rand 24)
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y software-properties-common curl apt-transport-https \
+        ca-certificates gnupg lsb-release tar unzip git
+
+    echo ">> Adding PHP repo..."
+    if [ "$ID" = "ubuntu" ]; then
+        LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+    else
+        curl -fsSL https://packages.sury.org/php/apt.gpg -o /etc/apt/trusted.gpg.d/php.gpg
+        echo "deb https://packages.sury.org/php/ $VERSION_CODENAME main" > /etc/apt/sources.list.d/php.list
+    fi
+    apt-get update -y
+
+    echo ">> Installing PHP, MariaDB, Nginx, Redis..."
+    apt-get install -y php$PHPV php$PHPV-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} \
+        mariadb-server nginx redis-server cron
+
+    systemctl enable --now mariadb redis-server nginx php$PHPV-fpm
+
+    echo ">> Installing Composer..."
+    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+    echo ">> Downloading panel..."
+    mkdir -p "$PANEL_DIR" && cd "$PANEL_DIR" || return
+    curl -fL -o panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+    tar -xzf panel.tar.gz && rm -f panel.tar.gz
+    chmod -R 755 storage/* bootstrap/cache/
+
+    echo ">> Creating database..."
+    mysql -u root <<EOF
+DROP USER IF EXISTS 'pterodactyl'@'127.0.0.1';
+CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';
+CREATE DATABASE IF NOT EXISTS panel;
+GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOF
+
+    echo ">> Configuring panel..."
+    cp -n .env.example .env
+    COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+    php artisan key:generate --force
+
+    php artisan p:environment:setup --author="$ADMIN_EMAIL" --url="$PANEL_URL" \
+        --timezone="$TZ_NAME" --cache=redis --session=redis --queue=redis \
+        --redis-host=127.0.0.1 --redis-pass= --redis-port=6379 \
+        --settings-ui=true --telemetry=false --no-interaction
+
+    php artisan p:environment:database --host=127.0.0.1 --port=3306 \
+        --database=panel --username=pterodactyl --password="$DB_PASS" --no-interaction
+
+    php artisan migrate --seed --force
+
+    php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" \
+        --name-first=Admin --name-last=User --password="$ADMIN_PASS" --admin=1 --no-interaction
+
+    # allow reverse proxy / cloudflare tunnel
+    grep -q '^TRUSTED_PROXIES' .env || echo 'TRUSTED_PROXIES=*' >> .env
+
+    chown -R www-data:www-data "$PANEL_DIR"/*
+
+    echo ">> Cron + queue worker..."
+    ( crontab -l 2>/dev/null | grep -v 'artisan schedule:run'; \
+      echo "* * * * * php $PANEL_DIR/artisan schedule:run >> /dev/null 2>&1" ) | crontab -
+
+    cat > /etc/systemd/system/pteroq.service <<EOF
+[Unit]
+Description=Pterodactyl Queue Worker
+After=redis-server.service
+
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+ExecStart=/usr/bin/php $PANEL_DIR/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl enable --now pteroq
+
+    echo ">> Nginx config..."
+    rm -f /etc/nginx/sites-enabled/default
+    cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    root $PANEL_DIR/public;
+    index index.php;
+
+    access_log /var/log/nginx/pterodactyl.app-access.log;
+    error_log  /var/log/nginx/pterodactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:/run/php/php$PHPV-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+
+    location ~ /\.ht { deny all; }
+}
+EOF
+    ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+    nginx -t && systemctl restart nginx
+
+    cat > /root/xzydip-panel-info.txt <<EOF
+Panel URL : $PANEL_URL
+Email     : $ADMIN_EMAIL
+Username  : $ADMIN_USER
+Password  : $ADMIN_PASS
+DB pass   : $DB_PASS
+EOF
+    chmod 600 /root/xzydip-panel-info.txt
+
+    echo
+    echo "=========== $BRAND PANEL READY ==========="
+    cat /root/xzydip-panel-info.txt
+    echo "(saved in /root/xzydip-panel-info.txt)"
+    echo "Panel listens on port 80. Use Cloudflare Tunnel (option 8) to expose it."
+    pause
+}
+
+# ============================================================
+# 2. DOCKER
+# ============================================================
+install_docker() {
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker
+    pause
+}
+
+fix_docker() {
+    echo ">> Fixing Docker..."
+    systemctl stop docker docker.socket containerd 2>/dev/null
+    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null
+    curl -fsSL https://get.docker.com | sh
+    modprobe overlay 2>/dev/null
+    modprobe br_netfilter 2>/dev/null
+    update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null
+    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null
+    systemctl daemon-reload
+    systemctl enable --now containerd
+    systemctl enable --now docker
+    sleep 3
+    if docker info >/dev/null 2>&1; then
+        echo "[OK] Docker running: $(docker --version)"
+    else
+        echo "[FAIL] Docker not running. Logs:"
+        journalctl -u docker --no-pager -n 25
+        echo "Docker does NOT work on OpenVZ/LXC. Use a KVM VPS."
+    fi
+    pause
+}
+
+# ============================================================
+# 3. WINGS
+# ============================================================
+install_wings() {
+    command -v docker >/dev/null 2>&1 || {
+        curl -fsSL https://get.docker.com | sh
+        systemctl enable --now docker
+    }
+    mkdir -p /etc/pterodactyl
+    case "$(uname -m)" in
+        x86_64)  ARCH=amd64 ;;
+        aarch64) ARCH=arm64 ;;
+        *) echo "Unsupported architecture"; pause; return ;;
+    esac
+    curl -fL -o /usr/local/bin/wings \
+        "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_$ARCH"
+    chmod u+x /usr/local/bin/wings
+
+    cat > /etc/systemd/system/wings.service <<'EOF'
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable wings
+    echo "[OK] Wings installed. Next: Configure Node, then Start Wings."
+    pause
+}
+
+configure_node() {
+    MODE=$(whiptail --title "$BRAND Node Config" --menu "Configure node by:" 14 70 2 \
+        "1" "Paste auto-deploy command from panel" \
+        "2" "Paste config.yml manually" 3>&1 1>&2 2>&3) || return
+    mkdir -p /etc/pterodactyl
+    if [ "$MODE" = "1" ]; then
+        echo "Panel -> Admin -> Nodes -> Configuration -> Generate Token"
+        echo "Paste the full command:"
+        read -r CMD
+        eval "$CMD"
+    else
+        echo "Paste config, then Ctrl+D on a new line:"
+        cat > /etc/pterodactyl/config.yml
+    fi
+    [ -s /etc/pterodactyl/config.yml ] && echo "[OK] config.yml saved." || echo "[FAIL] config.yml empty."
+    pause
+}
+
+start_wings() {
+    [ -s /etc/pterodactyl/config.yml ] || { echo "Run Configure Node first."; pause; return; }
+    systemctl enable --now wings
+    sleep 2
+    systemctl --no-pager status wings | head -n 15
+    echo "Wings runs in background (systemd)."
+    pause
+}
+
+wings_debug() {
+    systemctl stop wings 2>/dev/null
+    cd /etc/pterodactyl && wings --debug
+    pause
+}
+
+# ============================================================
+# 4. CLOUDFLARE
+# ============================================================
+install_cloudflared() {
+    case "$(uname -m)" in
+        x86_64)  CF=amd64 ;;
+        aarch64) CF=arm64 ;;
+        *) echo "Unsupported architecture"; pause; return ;;
+    esac
+    curl -fL -o /tmp/cloudflared.deb \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF.deb"
+    dpkg -i /tmp/cloudflared.deb || apt-get install -f -y
+    rm -f /tmp/cloudflared.deb
+
+    echo "Token: Cloudflare Zero Trust -> Networks -> Tunnels -> Create tunnel"
+    read -rp "Paste TOKEN: " TOKEN
+    if [ -n "$TOKEN" ]; then
+        cloudflared service uninstall 2>/dev/null
+        cloudflared service install "$TOKEN"
+        systemctl enable --now cloudflared
+        sleep 2
+        systemctl --no-pager status cloudflared | head -n 12
+        echo "Tunnel runs in background. Set Public Hostname -> http://localhost:80"
+    fi
+    pause
+}
+
+# ============================================================
+# 5. STATUS / LOGS / UPDATE
+# ============================================================
+show_status() {
+    for s in docker wings cloudflared nginx mariadb redis-server pteroq php$PHPV-fpm; do
+        printf "%-15s : %s\n" "$s" "$(systemctl is-active $s 2>/dev/null)"
+    done
+    echo; docker ps 2>/dev/null
+    pause
+}
+
+show_logs() {
+    echo "1) wings  2) cloudflared  3) docker  4) panel/nginx"
+    read -rp "Choose: " L
+    case "$L" in
+        1) journalctl -u wings -n 50 --no-pager ;;
+        2) journalctl -u cloudflared -n 50 --no-pager ;;
+        3) journalctl -u docker -n 50 --no-pager ;;
+        4) tail -n 50 /var/log/nginx/pterodactyl.app-error.log ;;
+    esac
+    pause
+}
+
+update_panel() {
+    cd "$PANEL_DIR" || { echo "Panel not installed."; pause; return; }
+    php artisan down
+    curl -fL https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz | tar -xzv
+    chmod -R 755 storage/* bootstrap/cache
+    COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+    php artisan view:clear
+    php artisan config:clear
+    php artisan migrate --seed --force
+    chown -R www-data:www-data "$PANEL_DIR"/*
+    php artisan queue:restart
+    php artisan up
+    echo "[OK] Panel updated."
+    pause
+}
+
+# ============================================================
+# MENU
+# ============================================================
+while true; do
+    CHOICE=$(whiptail --title "$BRAND - Pterodactyl Manager" --menu "Choose an option" 24 72 13 \
+        "1"  "Install Pterodactyl Panel" \
+        "2"  "Install Docker" \
+        "3"  "Fix Docker" \
+        "4"  "Install Wings" \
+        "5"  "Configure Node (token / config)" \
+        "6"  "Start Wings (background)" \
+        "7"  "Run Wings in debug mode" \
+        "8"  "Install Cloudflare Tunnel (background)" \
+        "9"  "Status of all services" \
+        "10" "View logs" \
+        "11" "Update Panel" \
+        "0"  "Exit" 3>&1 1>&2 2>&3) || exit 0
+
+    case "$CHOICE" in
+        1)  install_panel ;;
+        2)  install_docker ;;
+        3)  fix_docker ;;
+        4)  install_wings ;;
+        5)  configure_node ;;
+        6)  start_wings ;;
+        7)  wings_debug ;;
+        8)  install_cloudflared ;;
+        9)  show_status ;;
+        10) show_logs ;;
+        11) update_panel ;;
+        0)  exit 0 ;;
+    esac
+done
