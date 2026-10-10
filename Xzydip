@@ -1,0 +1,601 @@
+#!/usr/bin/env bash
+# ============================================================
+#  XZYDIP - Pterodactyl Panel Toolkit
+#  Ubuntu 22.04 / 24.04, Debian 11 / 12  (KVM VPS recommended)
+# ============================================================
+
+export LC_ALL=C.UTF-8 2>/dev/null
+
+BRAND="XZYDIP"
+VERSION="1.0"
+PANEL_DIR="/var/www/pterodactyl"
+PHPV="8.3"
+INFO_FILE="/root/xzydip-panel-info.txt"
+
+# ---------- colors ----------
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'
+W=$'\e[97m'; D=$'\e[2m'; B=$'\e[1m'; N=$'\e[0m'
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${R}Run as root:${N} sudo -i   then run the command again."
+    exit 1
+fi
+
+# ---------- helpers ----------
+pause()  { echo; read -rp "${D}Press Enter to go back...${N}" _; }
+ask()    { local v; read -rp "$1" v; echo "${v:-$2}"; }
+rand()   { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-24}"; }
+ok()     { echo -e "${G}[OK]${N} $*"; }
+fail()   { echo -e "${R}[FAIL]${N} $*"; }
+info()   { echo -e "${C}>>${N} $*"; }
+confirm() { local a; read -rp "${Y}$1 [y/N]: ${N}" a; [[ "$a" =~ ^[Yy]$ ]]; }
+
+center() {  # center "text" width
+    local t="$1" w="$2" l r
+    l=$(( (w - ${#t}) / 2 )); r=$(( w - ${#t} - l ))
+    printf '%*s%s%*s' "$l" "" "$t" "$r" ""
+}
+
+banner() {
+    clear
+    local w=48
+    echo -e "${R}╔$(printf '═%.0s' $(seq 1 $w))╗"
+    echo -e "║$(printf ' %.0s' $(seq 1 $w))║"
+    echo -e "║${C}$(center "◆ $BRAND ◆" $w)${R}║"
+    echo -e "║${G}$(center "Pterodactyl Panel Toolkit" $w)${R}║"
+    echo -e "║${Y}$(center "X Z Y D I P" $w)${R}║"
+    echo -e "║${W}$(center "v$VERSION" $w)${R}║"
+    echo -e "║$(printf ' %.0s' $(seq 1 $w))║"
+    echo -e "╚$(printf '═%.0s' $(seq 1 $w))╝${N}"
+    printf '%s' "${C}"
+    cat <<'ART'
+██╗  ██╗███████╗██╗   ██╗    ██████╗ ██╗██████╗ 
+╚██╗██╔╝╚══███╔╝╚██╗ ██╔╝    ██╔══██╗██║██╔══██╗
+ ╚███╔╝   ███╔╝  ╚████╔╝     ██║  ██║██║██████╔╝
+ ██╔██╗  ███╔╝    ╚██╔╝      ██║  ██║██║██╔═══╝ 
+██╔╝ ██╗███████╗   ██║       ██████╔╝██║██║     
+╚═╝  ╚═╝╚══════╝   ╚═╝       ╚═════╝ ╚═╝╚═╝
+ART
+    printf '%s\n' "${N}"
+}
+
+item() { echo -e " ${C}>${N} ${D}$1${N} ${W}$2${N}"; }
+
+# ============================================================
+# SYSTEM UPDATE
+# ============================================================
+system_update() {
+    info "Updating system..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y && apt-get upgrade -y && apt-get autoremove -y
+    ok "System updated."
+    pause
+}
+
+# ============================================================
+# PANEL
+# ============================================================
+install_panel() {
+    . /etc/os-release
+    info "$BRAND Panel Installer ($PRETTY_NAME)"
+
+    PANEL_URL=$(ask "Panel URL (e.g. https://panel.example.com): " "http://localhost")
+    ADMIN_EMAIL=$(ask "Admin email [admin@example.com]: " "admin@example.com")
+    ADMIN_USER=$(ask "Admin username [admin]: " "admin")
+    ADMIN_PASS=$(ask "Admin password [random]: " "$(rand 14)")
+    TZ_NAME=$(ask "Timezone [Asia/Kolkata]: " "Asia/Kolkata")
+    DB_PASS=$(rand 24)
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y software-properties-common curl apt-transport-https \
+        ca-certificates gnupg lsb-release tar unzip git
+
+    info "Adding PHP repo..."
+    if [ "$ID" = "ubuntu" ]; then
+        LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+    else
+        curl -fsSL https://packages.sury.org/php/apt.gpg -o /etc/apt/trusted.gpg.d/php.gpg
+        echo "deb https://packages.sury.org/php/ $VERSION_CODENAME main" > /etc/apt/sources.list.d/php.list
+    fi
+    apt-get update -y
+
+    info "Installing PHP, MariaDB, Nginx, Redis..."
+    apt-get install -y php$PHPV php$PHPV-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} \
+        mariadb-server nginx redis-server cron
+    systemctl enable --now mariadb redis-server nginx php$PHPV-fpm
+
+    info "Installing Composer..."
+    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+    info "Downloading panel..."
+    mkdir -p "$PANEL_DIR" && cd "$PANEL_DIR" || return
+    curl -fL -o panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+    tar -xzf panel.tar.gz && rm -f panel.tar.gz
+    chmod -R 755 storage/* bootstrap/cache/
+
+    info "Creating database..."
+    mysql -u root <<EOF
+DROP USER IF EXISTS 'pterodactyl'@'127.0.0.1';
+CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';
+CREATE DATABASE IF NOT EXISTS panel;
+GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOF
+
+    info "Configuring panel..."
+    cp -n .env.example .env
+    COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+    php artisan key:generate --force
+
+    php artisan p:environment:setup --author="$ADMIN_EMAIL" --url="$PANEL_URL" \
+        --timezone="$TZ_NAME" --cache=redis --session=redis --queue=redis \
+        --redis-host=127.0.0.1 --redis-pass= --redis-port=6379 \
+        --settings-ui=true --telemetry=false --no-interaction
+
+    php artisan p:environment:database --host=127.0.0.1 --port=3306 \
+        --database=panel --username=pterodactyl --password="$DB_PASS" --no-interaction
+
+    php artisan migrate --seed --force
+
+    php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" \
+        --name-first=Admin --name-last=User --password="$ADMIN_PASS" --admin=1 --no-interaction
+
+    grep -q '^TRUSTED_PROXIES' .env || echo 'TRUSTED_PROXIES=*' >> .env
+    chown -R www-data:www-data "$PANEL_DIR"/*
+
+    info "Cron + queue worker..."
+    ( crontab -l 2>/dev/null | grep -v 'artisan schedule:run'; \
+      echo "* * * * * php $PANEL_DIR/artisan schedule:run >> /dev/null 2>&1" ) | crontab -
+
+    cat > /etc/systemd/system/pteroq.service <<EOF
+[Unit]
+Description=Pterodactyl Queue Worker
+After=redis-server.service
+
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+ExecStart=/usr/bin/php $PANEL_DIR/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now pteroq
+
+    info "Nginx config..."
+    rm -f /etc/nginx/sites-enabled/default
+    cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    root $PANEL_DIR/public;
+    index index.php;
+
+    access_log /var/log/nginx/pterodactyl.app-access.log;
+    error_log  /var/log/nginx/pterodactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:/run/php/php$PHPV-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+
+    location ~ /\.ht { deny all; }
+}
+EOF
+    ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+    nginx -t && systemctl restart nginx
+
+    cat > "$INFO_FILE" <<EOF
+Panel URL : $PANEL_URL
+Email     : $ADMIN_EMAIL
+Username  : $ADMIN_USER
+Password  : $ADMIN_PASS
+DB pass   : $DB_PASS
+EOF
+    chmod 600 "$INFO_FILE"
+
+    echo
+    echo -e "${G}=========== $BRAND PANEL READY ===========${N}"
+    cat "$INFO_FILE"
+    echo "(saved in $INFO_FILE)"
+    echo "Panel runs on port 80. Use Cloudflare Tunnel to expose it."
+}
+
+update_panel() {
+    cd "$PANEL_DIR" || { fail "Panel not installed."; return; }
+    php artisan down
+    curl -fL https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz | tar -xz
+    chmod -R 755 storage/* bootstrap/cache
+    COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+    php artisan view:clear
+    php artisan config:clear
+    php artisan migrate --seed --force
+    chown -R www-data:www-data "$PANEL_DIR"/*
+    php artisan queue:restart
+    php artisan up
+    ok "Panel updated."
+}
+
+create_admin() {
+    cd "$PANEL_DIR" || { fail "Panel not installed."; return; }
+    php artisan p:user:make
+}
+
+panel_menu() {
+    while true; do
+        banner
+        echo -e "${Y}  PTERODACTYL PANEL SETUP${N}\n"
+        item 1 "📥 Install Panel"
+        item 2 "⬆️  Update Panel"
+        item 3 "👤 Create Admin User"
+        item 4 "🔑 Show Panel Login Info"
+        item 0 "↩️  Back"
+        echo
+        read -rp "${G}Select an option: ${N}" c
+        case "$c" in
+            1) confirm "Install Pterodactyl Panel?" && { install_panel; pause; } ;;
+            2) confirm "Update Panel?" && { update_panel; pause; } ;;
+            3) create_admin; pause ;;
+            4) [ -f "$INFO_FILE" ] && cat "$INFO_FILE" || fail "No info file found."; pause ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ============================================================
+# DOCKER / WINGS
+# ============================================================
+install_docker() {
+    info "Installing Docker..."
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker
+    docker --version && ok "Docker installed."
+}
+
+fix_docker() {
+    info "Fixing Docker..."
+    systemctl stop docker docker.socket containerd 2>/dev/null
+    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null
+    curl -fsSL https://get.docker.com | sh
+    modprobe overlay 2>/dev/null
+    modprobe br_netfilter 2>/dev/null
+    update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null
+    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null
+    systemctl daemon-reload
+    systemctl enable --now containerd
+    systemctl enable --now docker
+    sleep 3
+    if docker info >/dev/null 2>&1; then
+        ok "Docker running: $(docker --version)"
+    else
+        fail "Docker not running. Logs:"
+        journalctl -u docker --no-pager -n 25
+        echo -e "${Y}Docker does NOT work on OpenVZ/LXC or inside containers. Use a KVM VPS.${N}"
+    fi
+}
+
+install_wings() {
+    command -v docker >/dev/null 2>&1 || install_docker
+    mkdir -p /etc/pterodactyl
+    case "$(uname -m)" in
+        x86_64)  ARCH=amd64 ;;
+        aarch64) ARCH=arm64 ;;
+        *) fail "Unsupported architecture"; return ;;
+    esac
+    info "Downloading Wings..."
+    curl -fL -o /usr/local/bin/wings \
+        "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_$ARCH"
+    chmod u+x /usr/local/bin/wings
+
+    cat > /etc/systemd/system/wings.service <<'EOF'
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable wings
+    ok "Wings installed. Next: Configure Node, then Start Wings."
+}
+
+configure_node() {
+    mkdir -p /etc/pterodactyl
+    echo -e "${Y}1)${N} Paste auto-deploy command from panel"
+    echo -e "${Y}2)${N} Paste config.yml manually"
+    read -rp "${G}Choose: ${N}" m
+    if [ "$m" = "1" ]; then
+        echo "Panel -> Admin -> Nodes -> your node -> Configuration -> Generate Token"
+        echo "Paste the full command:"
+        read -r CMD
+        eval "$CMD"
+    else
+        echo "Paste config, then press Ctrl+D on a new line:"
+        cat > /etc/pterodactyl/config.yml
+    fi
+    if [ -s /etc/pterodactyl/config.yml ]; then ok "config.yml saved."; else fail "config.yml empty."; fi
+}
+
+start_wings() {
+    [ -s /etc/pterodactyl/config.yml ] || { fail "Run Configure Node first."; return; }
+    systemctl enable --now wings
+    sleep 2
+    systemctl --no-pager status wings | head -n 15
+    ok "Wings runs in background (systemd)."
+}
+
+wings_debug() {
+    systemctl stop wings 2>/dev/null
+    cd /etc/pterodactyl && wings --debug
+}
+
+wings_logs() { journalctl -u wings -n 60 --no-pager; }
+
+wings_menu() {
+    while true; do
+        banner
+        echo -e "${Y}  WINGS SETUP${N}\n"
+        item 1 "🐳 Install Docker"
+        item 2 "🛠️  Fix Docker"
+        item 3 "📥 Install Wings"
+        item 4 "⚙️  Configure Node (token / config)"
+        item 5 "▶️  Start Wings (background)"
+        item 6 "🐞 Run Wings in Debug Mode"
+        item 7 "📜 Wings Logs"
+        item 0 "↩️  Back"
+        echo
+        read -rp "${G}Select an option: ${N}" c
+        case "$c" in
+            1) confirm "Install Docker?" && { install_docker; pause; } ;;
+            2) confirm "Fix (reinstall) Docker?" && { fix_docker; pause; } ;;
+            3) confirm "Install Wings?" && { install_wings; pause; } ;;
+            4) configure_node; pause ;;
+            5) start_wings; pause ;;
+            6) wings_debug; pause ;;
+            7) wings_logs; pause ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ============================================================
+# CLOUDFLARE
+# ============================================================
+install_cloudflared() {
+    case "$(uname -m)" in
+        x86_64)  CF=amd64 ;;
+        aarch64) CF=arm64 ;;
+        *) fail "Unsupported architecture"; return ;;
+    esac
+    info "Installing cloudflared..."
+    curl -fL -o /tmp/cloudflared.deb \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF.deb"
+    dpkg -i /tmp/cloudflared.deb || apt-get install -f -y
+    rm -f /tmp/cloudflared.deb
+
+    echo "Token: Cloudflare Zero Trust -> Networks -> Tunnels -> Create tunnel"
+    read -rp "Paste TOKEN: " TOKEN
+    if [ -n "$TOKEN" ]; then
+        cloudflared service uninstall 2>/dev/null
+        cloudflared service install "$TOKEN"
+        systemctl enable --now cloudflared
+        sleep 2
+        systemctl --no-pager status cloudflared | head -n 12
+        ok "Tunnel runs in background."
+        echo "In tunnel Public Hostname set:  panel.yourdomain.com -> http://localhost:80"
+    else
+        fail "No token given, skipped."
+    fi
+}
+
+cloudflare_menu() {
+    while true; do
+        banner
+        echo -e "${Y}  CLOUDFLARE TUNNEL${N}\n"
+        item 1 "📥 Install / Setup Tunnel"
+        item 2 "📊 Tunnel Status"
+        item 3 "🔄 Restart Tunnel"
+        item 4 "📜 Tunnel Logs"
+        item 0 "↩️  Back"
+        echo
+        read -rp "${G}Select an option: ${N}" c
+        case "$c" in
+            1) confirm "Install Cloudflare Tunnel?" && { install_cloudflared; pause; } ;;
+            2) systemctl --no-pager status cloudflared | head -n 15; pause ;;
+            3) systemctl restart cloudflared && ok "Restarted."; pause ;;
+            4) journalctl -u cloudflared -n 60 --no-pager; pause ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ============================================================
+# SYSTEM SPEC / INSTALLED APPS / CREDITS
+# ============================================================
+system_spec() {
+    banner
+    . /etc/os-release
+    echo -e "${Y}  SYSTEM SPEC${N}\n"
+    printf " ${C}%-12s${N}: %s\n" "OS"        "$PRETTY_NAME"
+    printf " ${C}%-12s${N}: %s\n" "Kernel"    "$(uname -r)"
+    printf " ${C}%-12s${N}: %s\n" "CPU"       "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+    printf " ${C}%-12s${N}: %s\n" "Cores"     "$(nproc)"
+    printf " ${C}%-12s${N}: %s\n" "RAM"       "$(free -h | awk '/Mem:/ {print $3" / "$2}')"
+    printf " ${C}%-12s${N}: %s\n" "Disk"      "$(df -h / | awk 'NR==2 {print $3" / "$2" ("$5")"}')"
+    printf " ${C}%-12s${N}: %s\n" "Uptime"    "$(uptime -p)"
+    printf " ${C}%-12s${N}: %s\n" "Virtual"   "$(systemd-detect-virt 2>/dev/null || echo unknown)"
+    printf " ${C}%-12s${N}: %s\n" "Public IP" "$(curl -s --max-time 4 ifconfig.me || echo n/a)"
+    pause
+}
+
+installed_apps() {
+    banner
+    echo -e "${Y}  INSTALLED APPS${N}\n"
+    for s in docker wings cloudflared nginx mariadb redis-server pteroq php$PHPV-fpm; do
+        st=$(systemctl is-active "$s" 2>/dev/null)
+        if [ "$st" = "active" ]; then
+            printf " ${G}●${N} %-16s ${G}running${N}\n" "$s"
+        elif systemctl list-unit-files 2>/dev/null | grep -q "^$s"; then
+            printf " ${Y}●${N} %-16s ${Y}%s${N}\n" "$s" "$st"
+        else
+            printf " ${R}●${N} %-16s ${D}not installed${N}\n" "$s"
+        fi
+    done
+    echo
+    [ -d "$PANEL_DIR" ] && echo -e " ${G}Panel files found:${N} $PANEL_DIR" || echo -e " ${R}Panel not installed${N}"
+    echo
+    docker ps 2>/dev/null
+    pause
+}
+
+credits() {
+    banner
+    echo -e "${Y}  CREDITS${N}\n"
+    echo -e " ${C}Toolkit${N}  : $BRAND Pterodactyl Panel Toolkit v$VERSION"
+    echo -e " ${C}Made by${N}  : Xzydip"
+    echo -e " ${C}Based on${N} : Pterodactyl Panel & Wings (pterodactyl.io)"
+    pause
+}
+
+# ============================================================
+# UNINSTALL
+# ============================================================
+uninstall_panel() {
+    systemctl disable --now pteroq 2>/dev/null
+    rm -f /etc/systemd/system/pteroq.service
+    rm -f /etc/nginx/sites-enabled/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf
+    systemctl reload nginx 2>/dev/null
+    crontab -l 2>/dev/null | grep -v 'artisan schedule:run' | crontab -
+    mysql -u root -e "DROP DATABASE IF EXISTS panel; DROP USER IF EXISTS 'pterodactyl'@'127.0.0.1';" 2>/dev/null
+    rm -rf "$PANEL_DIR" "$INFO_FILE"
+    ok "Panel removed."
+}
+
+uninstall_wings() {
+    systemctl disable --now wings 2>/dev/null
+    rm -f /etc/systemd/system/wings.service /usr/local/bin/wings
+    rm -rf /etc/pterodactyl
+    if confirm "Also delete ALL server data in /var/lib/pterodactyl?"; then
+        rm -rf /var/lib/pterodactyl
+    fi
+    systemctl daemon-reload
+    ok "Wings removed."
+}
+
+uninstall_cloudflared() {
+    cloudflared service uninstall 2>/dev/null
+    apt-get remove -y cloudflared 2>/dev/null
+    ok "Cloudflared removed."
+}
+
+uninstall_menu() {
+    while true; do
+        banner
+        echo -e "${R}  UNINSTALL${N}\n"
+        item 1 "🗑️  Remove Panel"
+        item 2 "🗑️  Remove Wings"
+        item 3 "🗑️  Remove Cloudflare Tunnel"
+        item 0 "↩️  Back"
+        echo
+        read -rp "${G}Select an option: ${N}" c
+        case "$c" in
+            1) confirm "REMOVE the panel and its database?" && { uninstall_panel; pause; } ;;
+            2) confirm "REMOVE Wings?" && { uninstall_wings; pause; } ;;
+            3) confirm "REMOVE Cloudflare tunnel?" && { uninstall_cloudflared; pause; } ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ============================================================
+# AUTO SETUP
+# ============================================================
+auto_setup() {
+    banner
+    echo -e "${Y}  AUTO SETUP${N}\n"
+    echo " This will run: Update -> Panel -> Docker -> Wings -> Cloudflare -> Node config"
+    confirm "Start auto setup?" || return
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y && apt-get upgrade -y
+    install_panel
+    install_docker
+    install_wings
+    echo
+    info "Now create the node in the panel (Admin -> Locations -> Nodes), then:"
+    configure_node
+    start_wings
+    install_cloudflared
+    ok "Auto setup finished."
+    pause
+}
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+while true; do
+    banner
+    item 1  "🔄 System Update"
+    item 2  "☁️  Cloudflare"
+    item 3  "📁 Pterodactyl Panel Setup"
+    item 4  "🪽 Wings Setup"
+    item 5  "💻 System Spec"
+    item 6  "📦 Installed Apps"
+    item 7  "🏷️  Credits"
+    item 8  "🗑️  Uninstall"
+    echo -e " ${C}>${N} ${D}9${N}  🚀 ${Y}Auto Setup [Panel + Docker + Wings + Cloudflare]${N}"
+    echo -e " ${C}>${N} ${R}0${N} ❌ ${W}Exit${N}"
+    echo
+    read -rp "${G}Select an option: ${N}" CHOICE
+
+    case "$CHOICE" in
+        1) confirm "Update system?" && system_update ;;
+        2) cloudflare_menu ;;
+        3) panel_menu ;;
+        4) wings_menu ;;
+        5) system_spec ;;
+        6) installed_apps ;;
+        7) credits ;;
+        8) uninstall_menu ;;
+        9) auto_setup ;;
+        0) clear; exit 0 ;;
+    esac
+done
